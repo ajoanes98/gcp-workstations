@@ -1,0 +1,384 @@
+name: Build Workstation Dockerfile
+
+on:
+  workflow_dispatch:
+    inputs:
+      dockerfile_name:
+        description: "Unique name for the Dockerfile / image"
+        required: true
+        type: string
+      base_image:
+        description: "Base Docker image"
+        required: true
+        type: string
+      tools:
+        description: "Comma-separated list of tools to install"
+        required: true
+        type: string
+      node_version:
+        description: "Node.js version"
+        required: false
+        default: "20"
+        type: string
+      python_version:
+        description: "Python version"
+        required: false
+        default: "3.12"
+        type: string
+      java_distro:
+        description: "Java distribution"
+        required: false
+        default: "eclipse-temurin"
+        type: string
+      terraform_version:
+        description: "Terraform version"
+        required: false
+        default: "latest"
+        type: string
+      artifact_registry_region:
+        description: "Artifact Registry region"
+        required: true
+        type: string
+      artifact_registry_repo:
+        description: "Artifact Registry repository name"
+        required: true
+        type: string
+      gcp_project_id:
+        description: "GCP project ID"
+        required: true
+        type: string
+      gcp_sa_key_json:
+        description: "GCP service account key JSON (base64-encoded)"
+        required: true
+        type: string
+      port_run_id:
+        description: "Port action run ID"
+        required: true
+        type: string
+      triggered_by:
+        description: "Email of triggering user"
+        required: false
+        type: string
+
+jobs:
+  build-and-push:
+    name: Generate Dockerfile & Push to Artifact Registry
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      # ── 1. Notify Port: in progress ──────────────────────────────────────
+      - name: Notify Port – In Progress
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.getport.io
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          status: "IN_PROGRESS"
+          logMessage: "Generating Dockerfile for '${{ inputs.dockerfile_name }}' with tools: ${{ inputs.tools }}"
+
+      # ── 2. Authenticate to GCP via Service Account key ────────────────────
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ inputs.gcp_sa_key_json }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ inputs.gcp_project_id }}
+
+      # ── 3. Configure Docker for Artifact Registry ─────────────────────────
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ inputs.artifact_registry_region }}-docker.pkg.dev --quiet
+
+      # ── 4. Generate Dockerfile from tool selection ────────────────────────
+      - name: Generate Dockerfile
+        id: generate
+        run: |
+          set -euo pipefail
+          TOOLS="${{ inputs.tools }}"
+          BASE_IMAGE="${{ inputs.base_image }}"
+
+          cat > Dockerfile << 'DOCKERFILE_EOF'
+          FROM __BASE_IMAGE__
+
+          # ── Metadata ────────────────────────────────────────────────────────
+          LABEL maintainer="platform-engineering"
+          LABEL generated-by="port-self-service"
+          LABEL tools="__TOOLS__"
+
+          # ── System base ──────────────────────────────────────────────────────
+          ENV DEBIAN_FRONTEND=noninteractive
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+              curl wget ca-certificates gnupg lsb-release unzip zip \
+              build-essential software-properties-common apt-transport-https \
+              && rm -rf /var/lib/apt/lists/*
+          DOCKERFILE_EOF
+
+          # Replace placeholders
+          sed -i "s|__BASE_IMAGE__|${BASE_IMAGE}|g" Dockerfile
+          sed -i "s|__TOOLS__|${TOOLS}|g" Dockerfile
+
+          # ── git + GitHub CLI ──────────────────────────────────────────────
+          if echo "$TOOLS" | grep -q "git-github-cli"; then
+            cat >> Dockerfile << 'EOF'
+
+          # git + GitHub CLI
+          RUN apt-get update && apt-get install -y --no-install-recommends git && \
+              curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+                | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] \
+                https://cli.github.com/packages stable main" \
+                | tee /etc/apt/sources.list.d/github-cli.list && \
+              apt-get update && apt-get install -y gh && \
+              rm -rf /var/lib/apt/lists/*
+          EOF
+          fi
+
+          # ── Node.js ───────────────────────────────────────────────────────
+          if echo "$TOOLS" | grep -q "nodejs"; then
+            NODE_VER="${{ inputs.node_version }}"
+            cat >> Dockerfile << EOF
+
+          # Node.js ${NODE_VER}
+          RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VER}.x | bash - && \
+              apt-get install -y nodejs && \
+              rm -rf /var/lib/apt/lists/*
+          EOF
+          fi
+
+          # ── Python ────────────────────────────────────────────────────────
+          if echo "$TOOLS" | grep -q "python3"; then
+            PY_VER="${{ inputs.python_version }}"
+            cat >> Dockerfile << EOF
+
+          # Python ${PY_VER}
+          RUN add-apt-repository ppa:deadsnakes/ppa -y && \
+              apt-get update && \
+              apt-get install -y python${PY_VER} python${PY_VER}-venv python${PY_VER}-dev python3-pip && \
+              update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PY_VER} 1 && \
+              rm -rf /var/lib/apt/lists/*
+          EOF
+          fi
+
+          # ── Java 17 ───────────────────────────────────────────────────────
+          if echo "$TOOLS" | grep -q "java17"; then
+            JAVA_DISTRO="${{ inputs.java_distro }}"
+            cat >> Dockerfile << EOF
+
+          # Java 17 (${JAVA_DISTRO})
+          RUN apt-get update && \
+              apt-get install -y wget apt-transport-https && \
+              mkdir -p /etc/apt/keyrings && \
+              wget -O - https://packages.adoptium.net/artifactory/api/gpg/key/public \
+                | tee /etc/apt/keyrings/adoptium.asc && \
+              echo "deb [signed-by=/etc/apt/keyrings/adoptium.asc] \
+                https://packages.adoptium.net/artifactory/deb \$(lsb_release -cs) main" \
+                | tee /etc/apt/sources.list.d/adoptium.list && \
+              apt-get update && apt-get install -y temurin-17-jdk && \
+              rm -rf /var/lib/apt/lists/*
+          ENV JAVA_HOME=/usr/lib/jvm/temurin-17-amd64
+          ENV PATH=\$JAVA_HOME/bin:\$PATH
+          EOF
+          fi
+
+          # ── Docker-in-Docker ──────────────────────────────────────────────
+          if echo "$TOOLS" | grep -q "docker-in-docker"; then
+            cat >> Dockerfile << 'EOF'
+
+          # Docker-in-Docker
+          RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+                | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg && \
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] \
+                https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+                | tee /etc/apt/sources.list.d/docker.list && \
+              apt-get update && apt-get install -y docker-ce-cli docker-buildx-plugin && \
+              rm -rf /var/lib/apt/lists/*
+          EOF
+          fi
+
+          # ── kubectl ───────────────────────────────────────────────────────
+          if echo "$TOOLS" | grep -q "kubectl"; then
+            cat >> Dockerfile << 'EOF'
+
+          # kubectl (stable)
+          RUN curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key \
+                | gpg --dearmor -o /usr/share/keyrings/kubernetes-apt-keyring.gpg && \
+              echo "deb [signed-by=/usr/share/keyrings/kubernetes-apt-keyring.gpg] \
+                https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /" \
+                | tee /etc/apt/sources.list.d/kubernetes.list && \
+              apt-get update && apt-get install -y kubectl && \
+              rm -rf /var/lib/apt/lists/*
+          EOF
+          fi
+
+          # ── Terraform ─────────────────────────────────────────────────────
+          if echo "$TOOLS" | grep -q "terraform"; then
+            TF_VER="${{ inputs.terraform_version }}"
+            cat >> Dockerfile << EOF
+
+          # Terraform ${TF_VER}
+          RUN wget -O- https://apt.releases.hashicorp.com/gpg \
+                | gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg && \
+              echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+                https://apt.releases.hashicorp.com \$(lsb_release -cs) main" \
+                | tee /etc/apt/sources.list.d/hashicorp.list && \
+              apt-get update && apt-get install -y ${TF_VER:+terraform=}${TF_VER/latest/terraform} && \
+              rm -rf /var/lib/apt/lists/*
+          EOF
+          fi
+
+          # ── gcloud CLI ────────────────────────────────────────────────────
+          if echo "$TOOLS" | grep -q "gcloud-cli"; then
+            cat >> Dockerfile << 'EOF'
+
+          # gcloud CLI
+          RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] \
+                https://packages.cloud.google.com/apt cloud-sdk main" \
+                | tee /etc/apt/sources.list.d/google-cloud-sdk.list && \
+              curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+                | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
+              apt-get update && apt-get install -y google-cloud-cli && \
+              rm -rf /var/lib/apt/lists/*
+          EOF
+          fi
+
+          # ── VS Code Server ────────────────────────────────────────────────
+          if echo "$TOOLS" | grep -q "vscode-server"; then
+            cat >> Dockerfile << 'EOF'
+
+          # VS Code Server (code-server)
+          RUN curl -fsSL https://code-server.dev/install.sh | sh
+          EXPOSE 8080
+          EOF
+          fi
+
+          # ── Final user setup ──────────────────────────────────────────────
+          cat >> Dockerfile << 'EOF'
+
+          # ── User setup ───────────────────────────────────────────────────────
+          RUN useradd -m -s /bin/bash developer && \
+              echo "developer ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+          USER developer
+          WORKDIR /home/developer
+
+          CMD ["/bin/bash"]
+          EOF
+
+          echo "=== Generated Dockerfile ==="
+          cat Dockerfile
+          echo "dockerfile_lines=$(wc -l < Dockerfile)" >> $GITHUB_OUTPUT
+
+      # ── 5. Build and push image ───────────────────────────────────────────
+      - name: Build and Push Docker Image
+        id: docker_build
+        run: |
+          set -euo pipefail
+
+          REGISTRY="${{ inputs.artifact_registry_region }}-docker.pkg.dev"
+          PROJECT="${{ inputs.gcp_project_id }}"
+          REPO="${{ inputs.artifact_registry_repo }}"
+          IMAGE_NAME="${{ inputs.dockerfile_name }}"
+          TAG="$(date +%Y%m%d)-${GITHUB_RUN_NUMBER}"
+          FULL_IMAGE="${REGISTRY}/${PROJECT}/${REPO}/${IMAGE_NAME}:${TAG}"
+          LATEST_IMAGE="${REGISTRY}/${PROJECT}/${REPO}/${IMAGE_NAME}:latest"
+
+          echo "Building: $FULL_IMAGE"
+
+          docker build \
+            --tag "$FULL_IMAGE" \
+            --tag "$LATEST_IMAGE" \
+            --label "built-by=port-self-service" \
+            --label "run-id=${{ inputs.port_run_id }}" \
+            .
+
+          docker push "$FULL_IMAGE"
+          docker push "$LATEST_IMAGE"
+
+          echo "full_image=$FULL_IMAGE" >> $GITHUB_OUTPUT
+          echo "image_tag=$TAG" >> $GITHUB_OUTPUT
+          echo "registry_path=$FULL_IMAGE" >> $GITHUB_OUTPUT
+
+      # ── 6. Capture Dockerfile content for Port entity ─────────────────────
+      - name: Capture Dockerfile content
+        id: dockerfile_content
+        run: |
+          # Escape for JSON
+          CONTENT=$(cat Dockerfile | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+          echo "content=$CONTENT" >> $GITHUB_OUTPUT
+
+      # ── 7. Create Port entity ─────────────────────────────────────────────
+      - name: Create Port Dockerfile Entity
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.getport.io
+          operation: UPSERT
+          identifier: ${{ inputs.dockerfile_name }}
+          title: ${{ inputs.dockerfile_name }}
+          blueprint: gcp_dockerfile
+          runId: ${{ inputs.port_run_id }}
+          properties: |
+            {
+              "tools": "${{ inputs.tools }}".split(",").map(t => t.trim()),
+              "base_image": "${{ inputs.base_image }}",
+              "image_tag": "${{ steps.docker_build.outputs.full_image }}",
+              "registry_path": "${{ steps.docker_build.outputs.registry_path }}",
+              "dockerfile_content": "Built from: ${{ inputs.base_image }}\nTools: ${{ inputs.tools }}\nImage: ${{ steps.docker_build.outputs.full_image }}",
+              "build_status": "SUCCESS",
+              "created_by": "${{ inputs.triggered_by }}"
+            }
+
+      # ── 8. Report success ─────────────────────────────────────────────────
+      - name: Notify Port – Success
+        if: success()
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.getport.io
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          status: "SUCCESS"
+          logMessage: |
+            ✅ Dockerfile built and pushed successfully.
+            Image: ${{ steps.docker_build.outputs.full_image }}
+            Tools installed: ${{ inputs.tools }}
+            Next step: Use "Generate Workstation Config" to create a config from this image.
+
+      # ── 9. Report failure — also update entity build_status ───────────────
+      - name: Mark Entity Failed
+        if: failure()
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.getport.io
+          operation: UPSERT
+          identifier: ${{ inputs.dockerfile_name }}
+          blueprint: gcp_dockerfile
+          runId: ${{ inputs.port_run_id }}
+          properties: |
+            {
+              "build_status": "FAILED",
+              "tools": "${{ inputs.tools }}".split(",").map(t => t.trim()),
+              "base_image": "${{ inputs.base_image }}"
+            }
+
+      - name: Notify Port – Failure
+        if: failure()
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.getport.io
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          status: "FAILURE"
+          logMessage: "❌ Dockerfile build failed for '${{ inputs.dockerfile_name }}'. Check Actions logs."
