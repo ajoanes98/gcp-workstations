@@ -1,0 +1,242 @@
+name: Launch Workstation
+
+on:
+  workflow_dispatch:
+    inputs:
+      workstation_name:
+        description: "Unique workstation name"
+        required: true
+        type: string
+      workstation_display_name:
+        description: "Human-readable display name"
+        required: false
+        type: string
+      workstation_config_entity:
+        description: "Port entity identifier of the workstation config"
+        required: true
+        type: string
+      team:
+        description: "Team name (for audit/labelling)"
+        required: true
+        type: string
+      gcp_project_id:
+        description: "GCP project ID"
+        required: true
+        type: string
+      gcp_sa_key_json:
+        description: "GCP service account key JSON (base64-encoded)"
+        required: true
+        type: string
+      port_run_id:
+        description: "Port action run ID"
+        required: true
+        type: string
+      triggered_by:
+        description: "Email of triggering user"
+        required: false
+        type: string
+
+jobs:
+  launch-workstation:
+    name: Launch GCP Workstation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      # ── 1. Notify Port: in progress ──────────────────────────────────────
+      - name: Notify Port – In Progress
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.getport.io
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          status: "IN_PROGRESS"
+          logMessage: "Resolving workstation config '${{ inputs.workstation_config_entity }}'..."
+
+      # ── 2. Authenticate to GCP via Service Account key ────────────────────
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ inputs.gcp_sa_key_json }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ inputs.gcp_project_id }}
+
+      # ── 3. Resolve config properties from Port entity ─────────────────────
+      - name: Fetch Workstation Config entity from Port
+        id: fetch_config
+        run: |
+          set -euo pipefail
+
+          # Get Port access token
+          TOKEN=$(curl -s -X POST https://api.getport.io/v1/auth/access_token \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"${{ secrets.PORT_CLIENT_ID }}\",\"clientSecret\":\"${{ secrets.PORT_CLIENT_SECRET }}\"}" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["accessToken"])')
+
+          # Fetch the config entity
+          RESPONSE=$(curl -s -X GET \
+            "https://api.getport.io/v1/blueprints/gcp_workstation_config/entities/${{ inputs.workstation_config_entity }}" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json")
+
+          echo "Config entity response:"
+          echo "$RESPONSE" | python3 -m json.tool
+
+          # Extract fields
+          CLUSTER=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['entity']['properties']['cluster'])")
+          REGION=$(echo "$RESPONSE"  | python3 -c "import sys,json; print(json.load(sys.stdin)['entity']['properties']['region'])")
+          CONFIG_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['entity']['properties']['config_id'])")
+          STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['entity']['properties']['status'])")
+
+          if [ "$STATUS" != "READY" ]; then
+            echo "::error::Workstation config '${{ inputs.workstation_config_entity }}' has status '$STATUS' — only READY configs can be used."
+            exit 1
+          fi
+
+          echo "cluster=$CLUSTER"   >> $GITHUB_OUTPUT
+          echo "region=$REGION"     >> $GITHUB_OUTPUT
+          echo "config_id=$CONFIG_ID" >> $GITHUB_OUTPUT
+
+          echo "Resolved: cluster=$CLUSTER region=$REGION config_id=$CONFIG_ID"
+
+      # ── 4. Notify resolved config ─────────────────────────────────────────
+      - name: Notify Port – Config Resolved
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.getport.io
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: "Config resolved: ${{ steps.fetch_config.outputs.config_id }} in ${{ steps.fetch_config.outputs.region }}. Provisioning workstation..."
+
+      # ── 5. Create the workstation ─────────────────────────────────────────
+      - name: Create Workstation
+        id: create_ws
+        run: |
+          set -euo pipefail
+
+          DISPLAY_NAME="${{ inputs.workstation_display_name }}"
+          if [ -z "$DISPLAY_NAME" ]; then
+            DISPLAY_NAME="${{ inputs.workstation_name }}"
+          fi
+
+          gcloud workstations create "${{ inputs.workstation_name }}" \
+            --cluster="${{ steps.fetch_config.outputs.cluster }}" \
+            --config="${{ steps.fetch_config.outputs.config_id }}" \
+            --region="${{ steps.fetch_config.outputs.region }}" \
+            --project="${{ inputs.gcp_project_id }}" \
+            --display-name="$DISPLAY_NAME" \
+            --labels="team=${{ inputs.team }},created-by=port,owner=${{ inputs.triggered_by }}" \
+            --format=json \
+            --quiet | tee /tmp/ws_output.json
+
+          WS_HOST=$(jq -r '.host // ""' /tmp/ws_output.json)
+          if [ -n "$WS_HOST" ]; then
+            echo "ws_url=https://$WS_HOST" >> $GITHUB_OUTPUT
+          else
+            echo "ws_url=" >> $GITHUB_OUTPUT
+          fi
+
+      # ── 6. Wait for RUNNING state ─────────────────────────────────────────
+      - name: Wait for Workstation to be RUNNING
+        id: wait_running
+        run: |
+          set -euo pipefail
+          MAX_ATTEMPTS=30
+          SLEEP=10
+
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            STATE=$(gcloud workstations describe "${{ inputs.workstation_name }}" \
+              --cluster="${{ steps.fetch_config.outputs.cluster }}" \
+              --config="${{ steps.fetch_config.outputs.config_id }}" \
+              --region="${{ steps.fetch_config.outputs.region }}" \
+              --project="${{ inputs.gcp_project_id }}" \
+              --format="value(state)" 2>/dev/null || echo "UNKNOWN")
+
+            echo "Attempt $i/$MAX_ATTEMPTS – state: $STATE"
+
+            if [[ "$STATE" == *"RUNNING"* ]]; then
+              echo "final_state=RUNNING" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            sleep $SLEEP
+          done
+
+          echo "final_state=PROVISIONING" >> $GITHUB_OUTPUT
+
+      # ── 7. Fetch final workstation URL ────────────────────────────────────
+      - name: Fetch Final Workstation URL
+        id: final_url
+        run: |
+          HOST=$(gcloud workstations describe "${{ inputs.workstation_name }}" \
+            --cluster="${{ steps.fetch_config.outputs.cluster }}" \
+            --config="${{ steps.fetch_config.outputs.config_id }}" \
+            --region="${{ steps.fetch_config.outputs.region }}" \
+            --project="${{ inputs.gcp_project_id }}" \
+            --format="value(host)" 2>/dev/null || echo "")
+
+          if [ -n "$HOST" ]; then
+            echo "ws_url=https://$HOST" >> $GITHUB_OUTPUT
+          else
+            echo "ws_url=" >> $GITHUB_OUTPUT
+          fi
+
+      # ── 8. Upsert Port workstation entity ─────────────────────────────────
+      - name: Create Port Workstation Entity
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.getport.io
+          operation: UPSERT
+          identifier: ${{ inputs.workstation_name }}
+          title: ${{ inputs.workstation_name }}
+          blueprint: gcp_workstation
+          runId: ${{ inputs.port_run_id }}
+          properties: |
+            {
+              "workstation_id": "${{ inputs.workstation_name }}",
+              "cluster": "${{ steps.fetch_config.outputs.cluster }}",
+              "region": "${{ steps.fetch_config.outputs.region }}",
+              "config": "${{ steps.fetch_config.outputs.config_id }}",
+              "status": "${{ steps.wait_running.outputs.final_state }}",
+              "workstation_url": "${{ steps.final_url.outputs.ws_url }}",
+              "created_by": "${{ inputs.triggered_by }}",
+              "project_id": "${{ inputs.gcp_project_id }}"
+            }
+
+      # ── 9. Report success ─────────────────────────────────────────────────
+      - name: Notify Port – Success
+        if: success()
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.getport.io
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          status: "SUCCESS"
+          logMessage: |
+            ✅ Workstation '${{ inputs.workstation_name }}' is ${{ steps.wait_running.outputs.final_state }}.
+            Config: ${{ steps.fetch_config.outputs.config_id }} | Team: ${{ inputs.team }}
+            URL: ${{ steps.final_url.outputs.ws_url }}
+
+      # ── 10. Report failure ────────────────────────────────────────────────
+      - name: Notify Port – Failure
+        if: failure()
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.getport.io
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          status: "FAILURE"
+          logMessage: "❌ Failed to launch workstation '${{ inputs.workstation_name }}'. Check Actions logs."
