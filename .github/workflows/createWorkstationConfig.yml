@@ -118,7 +118,8 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ inputs.gcp_sa_key_json }}
+          workload_identity_provider: ${{ secrets.gcp_wif_provider }}
+          service_account: ${{ secrets.gcp_service_account }}
 
       - name: Set up gcloud CLI
         uses: google-github-actions/setup-gcloud@v2
